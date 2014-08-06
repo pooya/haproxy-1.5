@@ -110,6 +110,7 @@ static const struct logformat_type logformat_keywords[] = {
 	{ "ms", LOG_FMT_MS, PR_MODE_TCP, LW_INIT, NULL },       /* accept date millisecond */
 	{ "pid", LOG_FMT_PID, PR_MODE_TCP, LW_INIT, NULL }, /* log pid */
 	{ "r", LOG_FMT_REQ, PR_MODE_HTTP, LW_REQ, NULL },  /* request */
+        { "tR", LOG_FMT_REQ_TRUNC, PR_MODE_HTTP, LW_REQ, NULL },  /* truncated request */
 	{ "rc", LOG_FMT_RETRIES, PR_MODE_TCP, LW_BYTES, NULL },  /* retries */
 	{ "rt", LOG_FMT_COUNTER, PR_MODE_TCP, LW_REQ, NULL }, /* request counter (HTTP or TCP session) */
 	{ "s", LOG_FMT_SERVER, PR_MODE_TCP, LW_SVID, NULL },    /* server */
@@ -1513,6 +1514,22 @@ int build_logline(struct session *s, char *dst, size_t maxsize, struct list *lis
 					LOGCHAR('"');
 				last_isspace = 0;
 				break;
+
+                       case LOG_FMT_REQ_TRUNC: // %tR
+                               /* Truncated Request - 25 char max */
+                               if (tmp->options & LOG_OPT_QUOTE)
+                                   LOGCHAR('"');
+                               uri = txn->uri ? txn->uri : "<BADREQ>";
+                               ret = encode_string(tmplog, dst + maxsize,
+                                                      '#', url_encode_map, uri);
+                               if (ret == NULL || *ret != '\0')
+                                   goto out;
+                               ret[25] = '\0';
+                               tmplog = ret;
+                               if (tmp->options & LOG_OPT_QUOTE)
+                                       LOGCHAR('"');
+                               last_isspace = 0;
+                               break;
 
 			case LOG_FMT_COUNTER: // %rt
 				if (tmp->options & LOG_OPT_HEXA) {
