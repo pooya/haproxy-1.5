@@ -4117,8 +4117,9 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
  done:	/* done with this analyser, continue with next ones that the calling
 	 * points will have set, if any.
 	 */
-	req->analysers &= ~an_bit;
 	req->analyse_exp = TICK_ETERNITY;
+ done_without_exp: /* done with this analyser, but dont reset the analyse_exp. */
+	req->analysers &= ~an_bit;
 	return 1;
 
  tarpit:
@@ -4144,7 +4145,7 @@ int http_process_req_common(struct session *s, struct channel *req, int an_bit, 
 		s->be->be_counters.denied_req++;
 	if (s->listener->counters)
 		s->listener->counters->denied_req++;
-	goto done;
+	goto done_without_exp;
 
  deny:	/* this request was blocked (denied) */
 	txn->flags |= TX_CLDENY;
@@ -4885,8 +4886,8 @@ void http_end_txn_clean_session(struct session *s)
 	s->req->cons->conn_retries = 0;  /* used for logging too */
 	s->req->cons->exp       = TICK_ETERNITY;
 	s->req->cons->flags    &= SI_FL_DONT_WAKE; /* we're in the context of process_session */
-	s->req->flags &= ~(CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CONNECT|CF_WRITE_ERROR|CF_STREAMER|CF_STREAMER_FAST|CF_NEVER_WAIT|CF_WAKE_CONNECT);
-	s->rep->flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_READ_ATTACHED|CF_READ_ERROR|CF_READ_NOEXP|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_PARTIAL|CF_NEVER_WAIT);
+	s->req->flags &= ~(CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CONNECT|CF_WRITE_ERROR|CF_STREAMER|CF_STREAMER_FAST|CF_NEVER_WAIT|CF_WAKE_CONNECT|CF_WROTE_DATA);
+	s->rep->flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_READ_ATTACHED|CF_READ_ERROR|CF_READ_NOEXP|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_PARTIAL|CF_NEVER_WAIT|CF_WROTE_DATA);
 	s->flags &= ~(SN_DIRECT|SN_ASSIGNED|SN_ADDR_SET|SN_BE_ASSIGNED|SN_FORCE_PRST|SN_IGNORE_PRST);
 	s->flags &= ~(SN_CURR_SESS|SN_REDIRECTABLE|SN_SRV_REUSED);
 
@@ -5429,7 +5430,7 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
 			 * such as last chunk of data or trailers.
 			 */
 			b_adv(req->buf, msg->next);
-			if (unlikely(!(s->rep->flags & CF_READ_ATTACHED)))
+			if (unlikely(!(s->req->flags & CF_WROTE_DATA)))
 				msg->sov -= msg->next;
 			msg->next = 0;
 
@@ -5481,7 +5482,7 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
  missing_data:
 	/* we may have some pending data starting at req->buf->p */
 	b_adv(req->buf, msg->next);
-	if (unlikely(!(s->rep->flags & CF_READ_ATTACHED)))
+	if (unlikely(!(s->req->flags & CF_WROTE_DATA)))
 		msg->sov -= msg->next + MIN(msg->chunk_len, req->buf->i);
 
 	msg->next = 0;
@@ -6248,7 +6249,7 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 
 		/* add response headers from the rule sets in the same order */
 		list_for_each_entry(wl, &rule_set->rsp_add, list) {
-			if (txn->status < 200)
+			if (txn->status < 200 && txn->status != 101)
 				break;
 			if (wl->cond) {
 				int ret = acl_exec_cond(wl->cond, px, s, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
@@ -6269,7 +6270,7 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 	}
 
 	/* OK that's all we can do for 1xx responses */
-	if (unlikely(txn->status < 200))
+	if (unlikely(txn->status < 200 && txn->status != 101))
 		goto skip_header_mangling;
 
 	/*
@@ -6282,7 +6283,7 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 	/*
 	 * Check for cache-control or pragma headers if required.
 	 */
-	if ((s->be->options & PR_O_CHK_CACHE) || (s->be->ck_opts & PR_CK_NOC))
+	if (((s->be->options & PR_O_CHK_CACHE) || (s->be->ck_opts & PR_CK_NOC)) && txn->status != 101)
 		check_response_for_cacheability(s, rep);
 
 	/*
@@ -6398,9 +6399,11 @@ int http_process_res_common(struct session *s, struct channel *rep, int an_bit, 
 	 * Adjust "Connection: close" or "Connection: keep-alive" if needed.
 	 * If an "Upgrade" token is found, the header is left untouched in order
 	 * not to have to deal with some client bugs : some of them fail an upgrade
-	 * if anything but "Upgrade" is present in the Connection header.
+	 * if anything but "Upgrade" is present in the Connection header. We don't
+	 * want to touch any 101 response either since it's switching to another
+	 * protocol.
 	 */
-	if (!(txn->flags & TX_HDR_CONN_UPG) &&
+	if ((txn->status != 101) && !(txn->flags & TX_HDR_CONN_UPG) &&
 	    (((txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN) ||
 	     ((s->fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL ||
 	      (s->be->options & PR_O_HTTP_MODE) == PR_O_HTTP_PCL))) {
@@ -9281,8 +9284,8 @@ struct http_res_rule *parse_http_res_cond(const char **args, const char *file, i
 		cur_arg = 1;
 
 		if (!*args[cur_arg] || !*args[cur_arg+1] || !*args[cur_arg+2] ||
-		    (*args[cur_arg+3] && strcmp(args[cur_arg+2], "if") != 0 && strcmp(args[cur_arg+2], "unless") != 0)) {
-			Alert("parsing [%s:%d]: 'http-request %s' expects exactly 3 arguments.\n",
+		    (*args[cur_arg+3] && strcmp(args[cur_arg+3], "if") != 0 && strcmp(args[cur_arg+3], "unless") != 0)) {
+			Alert("parsing [%s:%d]: 'http-response %s' expects exactly 3 arguments.\n",
 			      file, linenum, args[0]);
 			goto out_err;
 		}
@@ -9770,20 +9773,13 @@ smp_prefetch_http(struct proxy *px, struct session *s, void *l7, unsigned int op
 static int pat_parse_meth(const char *text, struct pattern *pattern, int mflags, char **err)
 {
 	int len, meth;
-	struct chunk *trash;
 
 	len  = strlen(text);
 	meth = find_http_meth(text, len);
 
 	pattern->val.i = meth;
 	if (meth == HTTP_METH_OTHER) {
-		trash = get_trash_chunk();
-		if (trash->size < len) {
-			memprintf(err, "no space avalaible in the buffer. expect %d, provides %d",
-			          len, trash->size);
-			return 0;
-		}
-		pattern->ptr.str = trash->str;
+		pattern->ptr.str = (char *)text;
 		pattern->len = len;
 	}
 	else {
@@ -9848,8 +9844,8 @@ static struct pattern *pat_match_meth(struct sample *smp, struct pattern_expr *e
 			continue;
 
 		icase = expr->mflags & PAT_MF_IGNORE_CASE;
-		if ((icase && strncasecmp(pattern->ptr.str, smp->data.meth.str.str, smp->data.meth.str.len) != 0) ||
-		    (!icase && strncmp(pattern->ptr.str, smp->data.meth.str.str, smp->data.meth.str.len) != 0))
+		if ((icase && strncasecmp(pattern->ptr.str, smp->data.meth.str.str, smp->data.meth.str.len) == 0) ||
+		    (!icase && strncmp(pattern->ptr.str, smp->data.meth.str.str, smp->data.meth.str.len) == 0))
 			return pattern;
 	}
 	return NULL;
