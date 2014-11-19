@@ -2386,6 +2386,10 @@ struct task *process_session(struct task *t)
 	 * FIXME: this is probably where we should produce error responses.
 	 */
 
+	if ((rpf_last & CF_SHUTW) && (rpf_last & CF_AUTO_CLOSE)) {
+		http_notify_timeout(s, s->rep);
+	}
+
 	/* first, let's check if the response buffer needs to shutdown(write) */
 	if (unlikely((s->rep->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CLOSE|CF_SHUTR)) ==
 		     (CF_AUTO_CLOSE|CF_SHUTR))) {

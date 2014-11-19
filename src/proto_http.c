@@ -5589,6 +5589,25 @@ int http_request_forward_body(struct session *s, struct channel *req, int an_bit
 	return 0;
 }
 
+int http_notify_timeout(struct session *s, struct channel *rep)
+{
+	struct http_txn *txn = &s->txn;
+
+	channel_auto_close(rep);
+	rep->analysers = 0;
+	txn->status = 504;
+	rep->prod->flags |= SI_FL_NOLINGER;
+	bi_erase(rep);
+	stream_int_retnclose(rep->cons, http_error_message(s, HTTP_ERR_504));
+
+	if (!(s->flags & SN_ERR_MASK))
+		s->flags |= SN_ERR_SRVTO;
+	if (!(s->flags & SN_FINST_MASK))
+		s->flags |= SN_FINST_H;
+
+	return 0;
+}
+
 /* This stream analyser waits for a complete HTTP response. It returns 1 if the
  * processing can continue on next analysers, or zero if it either needs more
  * data or wants to immediately abort the response (eg: timeout, error, ...). It
